@@ -1,0 +1,897 @@
+name: Full CI & Staging Deploy
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'backend/**'
+      - 'e2e_tests/**'
+      - 'frontend/**'
+      - 'helm/**'
+      - 'infra_compose/**'
+      - '.github/workflows/ci-deploy.yml'
+  pull_request:
+    paths:
+      - 'backend/**'
+      - 'e2e_tests/**'
+      - 'frontend/**'
+      - 'helm/**'
+      - 'infra_compose/**'
+
+jobs:
+  # === infra_compose LINTING ===
+  infra_compose-dotenv:
+    name: infra_compose Dotenv Linter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+          cache: false         
+      - name: Install dotenv-linter
+        run: cargo install dotenv-linter
+      - name: Run dotenv-linter
+        run: dotenv-linter scan infra_compose/
+
+  infra_compose-yamllint:
+    name: infra_compose YAML Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Python & yamllint
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip
+          pip3 install yamllint
+      - name: Run yamllint
+        run: yamllint --no-warnings -c .yamllint.yml infra_compose/
+
+  infra_compose-shellcheck:
+    name: infra_compose Shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Run shellcheck on all scripts
+        run: |
+          find infra_compose/ -type f -perm /u=x,g=x,o=x -print0 \
+            | xargs -0 grep -Il '^#!.*\(sh\|bash\)' \
+            | xargs -r shellcheck
+
+
+  # === infra_compose DEVSECOPS ===
+  infra_compose-devsec-gitleaks:
+    name: infra_compose DevSecOps (Gitleaks secret scan)
+    runs-on: ubuntu-latest
+    needs:
+      - infra_compose-dotenv
+      - infra_compose-yamllint
+      - infra_compose-shellcheck
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+          cache: false
+      - name: Install Gitleaks
+        run: go install github.com/zricethezav/gitleaks/v8@latest
+      - name: Add Go bin to PATH
+        run: echo "${HOME}/go/bin" >> $GITHUB_PATH
+      - name: Run Gitleaks
+        run: |
+          gitleaks detect \
+            --source infra_compose/ \
+            --report-path infra_compose/gitleaks-report.json \
+            --exit-code 1 \
+            --redact
+      - name: Upload Gitleaks report
+        uses: actions/upload-artifact@v4
+        with:
+          name: infra_compose-gitleaks-report
+          path: infra_compose/gitleaks-report.json
+
+
+  # === HELM LINTING ===
+  helm-dotenv:
+    name: Helm Dotenv Linter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+          cache: false
+      - name: Install dotenv-linter
+        run: cargo install dotenv-linter
+      - name: Run dotenv-linter
+        run: dotenv-linter scan helm/
+
+  helm-yamllint:
+    name: Helm YAML Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Python & yamllint
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip
+          pip3 install yamllint
+      - name: Run yamllint
+        run: yamllint --no-warnings -c .yamllint.yml helm/
+
+  helm-shellcheck:
+    name: Helm Shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Run shellcheck on all scripts
+        run: |
+          find helm/ -type f -perm /u=x,g=x,o=x -print0 \
+            | xargs -0 grep -Il '^#!.*\(sh\|bash\)' \
+            | xargs -r shellcheck
+
+  helm-helm-lint:
+    name: Helm Linter (skipped)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skipped — custom Helm structure
+        run: echo "helm lint skipped — managed via helmfile and external values"
+
+  helm-helmfile-lint:
+    name: Helmfile Lint (safe)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Helmfile
+        run: |
+          curl -sL https://github.com/helmfile/helmfile/releases/download/v0.160.0/helmfile_0.160.0_linux_amd64.tar.gz | tar xz
+          sudo mv helmfile /usr/local/bin/
+      - name: Run helmfile lint (non-blocking)
+        run: |
+          set +e
+          VERSION=1.0.0 helmfile -f helm/helmfile.prod.gotmpl lint --skip-deps
+          echo "helmfile lint exited with code $?"
+          set -e
+
+  helm-kubeconform:
+    name: Helm Kubeconform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install tools
+        run: |
+          curl -sL https://github.com/helmfile/helmfile/releases/download/v0.160.0/helmfile_0.160.0_linux_amd64.tar.gz | tar xz
+          sudo mv helmfile /usr/local/bin/
+          curl -sL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz | tar xz
+          sudo mv kubeconform /usr/local/bin/
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      - name: Build chart dependencies
+        run: |
+          helm dependency build bitnami_charts/bitnami/postgresql
+      - name: Render templates
+        run: |
+          mkdir -p rendered
+          VERSION=1.0.0 helmfile -f helm/helmfile.prod.gotmpl template --skip-deps > rendered/all.yaml
+          csplit -sz -f rendered/split- rendered/all.yaml '/^---$/' '{*}'
+          sed -i '/^---$/d' rendered/split-*
+          for f in rendered/split-*; do mv "$f" "$f.yaml"; done
+      - name: Run kubeconform (non-blocking)
+        run: |
+          set +e
+          for f in rendered/*.yaml; do
+            echo "::group::Validating $f"
+            kubeconform -strict -summary "$f"
+            echo "::endgroup::"
+          done
+          set -e
+
+
+  # === HELM DEVSECOPS ===
+  helm-devsec-gitleaks:
+    name: Helm DevSecOps (Gitleaks secret scan)
+    runs-on: ubuntu-latest
+    needs:
+      - helm-dotenv
+      - helm-yamllint
+      - helm-shellcheck
+      - helm-helm-lint
+      - helm-helmfile-lint
+      - helm-kubeconform
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+          cache: false
+      - name: Install Gitleaks
+        run: go install github.com/zricethezav/gitleaks/v8@latest
+      - name: Add Go bin to PATH
+        run: echo "${HOME}/go/bin" >> $GITHUB_PATH
+      - name: Run Gitleaks
+        run: |
+          gitleaks detect \
+            --source helm/ \
+            --report-path helm/gitleaks-report.json \
+            --exit-code 1 \
+            --redact
+      - name: Upload Gitleaks report
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-gitleaks-report
+          path: helm/gitleaks-report.json
+
+  helm-devsec-semgrep:
+    name: Helm DevSecOps (Semgrep)
+    runs-on: ubuntu-latest
+    needs:
+      - helm-dotenv
+      - helm-yamllint
+      - helm-shellcheck
+      - helm-helm-lint
+      - helm-helmfile-lint
+      - helm-kubeconform
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Install Semgrep
+        run: pip install semgrep
+      - name: Run Semgrep (SAST)
+        run: |
+          semgrep \
+            --config p/ci \
+            --severity ERROR \
+            --error \
+            --json \
+            --output semgrep-report.json \
+            helm/
+      - name: Upload Semgrep report
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-semgrep-report
+          path: semgrep-report.json
+
+  helm-devsec-trivy-config:
+    name: Helm DevSecOps (Trivy Config scan)
+    runs-on: ubuntu-latest
+    needs:
+      - helm-dotenv
+      - helm-yamllint
+      - helm-shellcheck
+      - helm-helm-lint
+      - helm-helmfile-lint
+      - helm-kubeconform
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+      - name: Run Trivy Config scan (table)
+        run: |
+          trivy config \
+            --exit-code 1 \
+            --severity HIGH,CRITICAL \
+            --format table \
+            helm/
+      - name: Run Trivy Config scan (JSON)
+        run: |
+          trivy config \
+            --severity HIGH,CRITICAL \
+            --format json \
+            --output trivy-config-report.json \
+            helm/
+      - name: Upload Trivy Config report
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-trivy-config-report
+          path: trivy-config-report.json
+
+  helm-devsec-polaris:
+    name: Helm DevSecOps (Polaris)
+    runs-on: ubuntu-latest
+    needs:
+      - helm-dotenv
+      - helm-yamllint
+      - helm-shellcheck
+      - helm-helm-lint
+      - helm-helmfile-lint
+      - helm-kubeconform
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Helm
+        run: |
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      - name: Install Helmfile
+        run: |
+          curl -sL https://github.com/helmfile/helmfile/releases/download/v0.160.0/helmfile_0.160.0_linux_amd64.tar.gz | tar xz
+          sudo mv helmfile /usr/local/bin/
+      - name: Install Polaris
+        run: |
+          curl -sL https://github.com/FairwindsOps/polaris/releases/latest/download/polaris_linux_amd64.tar.gz | tar -xz
+          sudo mv polaris /usr/local/bin/
+      - name: Render Helm templates
+        run: |
+          mkdir -p rendered
+          helm dependency build bitnami_charts/bitnami/postgresql
+          VERSION=1.0.0 helmfile -f helm/helmfile.prod.gotmpl template --skip-deps > rendered.yaml
+          csplit -sz -f rendered/split- rendered.yaml '/^---$/' '{*}'
+          sed -i '/^---$/d' rendered/split-*
+          for f in rendered/split-*; do mv "$f" "$f.yaml"; done
+      - name: Run Polaris
+        run: |
+          polaris audit --audit-path rendered/ --format json --output-file polaris-report.json || true
+      - name: Upload Polaris report
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-polaris-report
+          path: polaris-report.json
+
+  # === E2E ТЕСТЫ БАЗОВЫЕ ПРОВЕРКИ ===
+  e2e-pre-commit:
+    name: E2E tests Pre-commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pre-commit
+        run: pip install pre-commit
+      - name: Run pre-commit on e2e_tests
+        run: pre-commit run --show-diff-on-failure --files e2e_tests
+
+  e2e-linter:
+    name: E2E tests Linter
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: e2e_tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('e2e_tests/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      - name: Install Black
+        run: pip install black
+      - name: Run Black check
+        run: black --check .
+
+  e2e-devsec-code-scan:
+    name: E2E tests DevSecOps (Semgrep + Trivy FS)
+    runs-on: ubuntu-latest
+    needs: [e2e-pre-commit, e2e-linter]
+    defaults:
+      run:
+        working-directory: e2e_tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Semgrep & Trivy
+        run: |
+          pip install semgrep
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+      - name: Run Semgrep (SAST)
+        run: semgrep scan --config auto
+      - name: Run Trivy FS scan
+        run: trivy fs . --exit-code 1 --severity HIGH,CRITICAL --no-progress --format table
+      - name: Generate Trivy FS JSON report
+        run: trivy fs . --severity HIGH,CRITICAL --format json -o trivy-fs-report.json
+      - name: Upload Trivy FS report
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-trivy-fs-report
+          path: e2e_tests/trivy-fs-report.json
+
+
+  # === BACKEND ПРОВЕРКИ И СБОРКА ОБРАЗОВ ===
+  backend-pre-commit:
+    name: Back Pre-commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('backend/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      - name: Install pre-commit
+        run: pip install pre-commit
+      - name: Run pre-commit hooks on backend
+        run: pre-commit run --show-diff-on-failure --files backend
+
+  backend-linter:
+    name: Back Linter
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('backend/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      - name: Install Black
+        run: pip install black
+      - name: Run Black check
+        run: black --check .
+
+  backend-unit:
+    name: Back Unit tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      - run: pip install -r requirements.txt
+      - name: Run unit tests
+        run: PYTHONPATH=./ pytest --junitxml=report.xml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backend-unit-test-report
+          path: backend/report.xml
+
+  backend-devsec-code-scan:
+    name: Back DevSecOps (Semgrep + Trivy FS)
+    runs-on: ubuntu-latest
+    needs:
+      - backend-pre-commit
+      - backend-linter
+      - backend-unit
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Semgrep & Trivy
+        run: |
+          pip install semgrep
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+      - name: Run Semgrep (SAST)
+        run: semgrep scan --config auto
+      - name: Run Trivy FS scan (source code & deps)
+        run: trivy fs . --exit-code 1 --severity HIGH,CRITICAL --no-progress --format table
+      - name: Generate Trivy FS JSON report
+        run: |
+          trivy fs . --severity HIGH,CRITICAL --format json -o trivy-fs-report.json
+      - name: Upload Trivy FS report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-trivy-fs-report
+          path: backend/trivy-fs-report.json
+
+  backend-create-image:
+    name: Back Docker build & push (:latest, :sha)
+    runs-on: ubuntu-latest
+    needs: 
+      - backend-devsec-code-scan
+      - e2e-devsec-code-scan
+      - infra_compose-devsec-gitleaks
+      - helm-devsec-gitleaks
+      - helm-devsec-semgrep
+      - helm-devsec-trivy-config
+      - helm-devsec-polaris
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Docker build and push
+        run: |
+          IMAGE=ghcr.io/vik-devops-lab/health-api-backend
+          docker build -t $IMAGE:latest -t $IMAGE:sha-${{ github.sha }} .
+          docker push $IMAGE:latest
+          docker push $IMAGE:sha-${{ github.sha }}
+          echo "$IMAGE:sha-${{ github.sha }}" > backend-image-tag.txt
+      - name: Debug tag file
+        run: |
+          ls -la
+          cat backend-image-tag.txt || echo "tag file missing"
+      - name: Upload image tag
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-image-tag
+          path: backend/backend-image-tag.txt
+
+  backend-devsec-image-scan:
+    name: Back DevSecOps image scan (Trivy)
+    runs-on: ubuntu-latest
+    needs: backend-create-image
+    steps:
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull built image from GHCR
+        run: |
+          IMAGE=ghcr.io/vik-devops-lab/health-api-backend
+          docker pull $IMAGE:latest
+      - name: Run Trivy Docker image scan
+        run: |
+          IMAGE=ghcr.io/vik-devops-lab/health-api-backend
+          trivy image --exit-code 0 --severity HIGH,CRITICAL --no-progress --format table $IMAGE:latest
+      - name: Generate Trivy JSON report
+        run: |
+          IMAGE=ghcr.io/vik-devops-lab/health-api-backend
+          trivy image --severity HIGH,CRITICAL --format json -o trivy-report.json $IMAGE:latest
+      - name: Upload Trivy report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-trivy-image-report
+          path: trivy-report.json
+
+
+  # === FRONTEND ПРОВЕРКИ И СБОРКА ОБРАЗОВ ===
+  frontend-pre-commit:
+    name: Front Pre-commit (skipped)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip pre-commit
+        run: echo "No .pre-commit-config.yaml found, skipping Pre-commit"
+
+  frontend-linter:
+    name: Front Linter (skipped)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip linting
+        run: echo "No lint script in package.json, skipping lint step"
+
+  frontend-unit:
+    name: Front Unit tests (skipped)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip unit tests
+        run: echo "No unit tests implemented, skipping test step"
+
+  frontend-devsec-code-scan:
+    name: Front DevSecOps (Semgrep + Trivy FS)
+    runs-on: ubuntu-latest
+    needs:
+      - frontend-pre-commit
+      - frontend-linter
+      - frontend-unit
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Semgrep & Trivy
+        run: |
+          pip install semgrep
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+      - name: Run Semgrep (SAST)
+        run: semgrep scan --config auto
+      - name: Run Trivy FS scan (source code & deps)
+        run: trivy fs . --exit-code 1 --severity HIGH,CRITICAL --no-progress --format table
+      - name: Generate Trivy FS JSON report
+        run: |
+          trivy fs . --severity HIGH,CRITICAL --format json -o trivy-fs-report.json
+      - name: Upload Trivy FS report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-trivy-fs-report
+          path: frontend/trivy-fs-report.json
+
+  frontend-create-image:
+    name: Front Docker build & push (:latest, :sha)
+    runs-on: ubuntu-latest
+    needs:
+      - frontend-devsec-code-scan
+      - e2e-devsec-code-scan
+      - infra_compose-devsec-gitleaks
+      - helm-devsec-gitleaks
+      - helm-devsec-semgrep
+      - helm-devsec-trivy-config
+      - helm-devsec-polaris
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Docker build and push
+        run: |
+          IMAGE=ghcr.io/vik-devops-lab/health-api-frontend
+          docker build -t $IMAGE:latest -t $IMAGE:sha-${{ github.sha }} .
+          docker push $IMAGE:latest
+          docker push $IMAGE:sha-${{ github.sha }}
+          echo "$IMAGE:sha-${{ github.sha }}" > frontend-image-tag.txt
+      - name: Debug tag file
+        run: |
+          ls -la
+          cat frontend-image-tag.txt || echo "tag file missing"
+      - name: Upload image tag
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-image-tag
+          path: frontend/frontend-image-tag.txt
+
+  frontend-devsec-image-scan:
+    name: Front DevSecOps image scan (Trivy)
+    runs-on: ubuntu-latest
+    needs: frontend-create-image
+    steps:
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull built image from GHCR
+        run: |
+          IMAGE=ghcr.io/vik-devops-lab/health-api-frontend
+          docker pull $IMAGE:latest
+      - name: Run Trivy Docker image scan
+        run: |
+          IMAGE=ghcr.io/vik-devops-lab/health-api-frontend
+          trivy image --exit-code 0 --severity HIGH,CRITICAL --no-progress --format table $IMAGE:latest
+      - name: Generate Trivy JSON report
+        run: |
+          IMAGE=ghcr.io/vik-devops-lab/health-api-frontend
+          trivy image --severity HIGH,CRITICAL --format json -o trivy-report.json $IMAGE:latest
+      - name: Upload Trivy report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-trivy-image-report
+          path: trivy-report.json
+
+  # === STAGING DEPLOY И Е2Е ТЕСТЫ ===
+  deploy-stage-e2e-tests:
+    name: Deploy-Staging-E2E-Tests
+    runs-on: ubuntu-latest
+    needs: [backend-devsec-image-scan, frontend-devsec-image-scan]
+    environment:
+      name: staging
+      url: https://staging.health-api.example.com
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # === BACKEND ===
+      - name: Download backend image tag
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-image-tag
+      - name: Read backend tag
+        id: backend
+        run: echo "IMAGE_TAG=$(cat backend-image-tag.txt)" >> $GITHUB_OUTPUT
+      - name: Pull backend image
+        run: docker pull ${{ steps.backend.outputs.IMAGE_TAG }}
+
+      # === FRONTEND ===
+      - name: Download frontend image tag
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-image-tag
+      - name: Read frontend tag
+        id: frontend
+        run: echo "IMAGE_TAG=$(cat frontend-image-tag.txt)" >> $GITHUB_OUTPUT
+      - name: Pull frontend image
+        run: docker pull ${{ steps.frontend.outputs.IMAGE_TAG }}
+
+      # === START STACK ===
+      - name: Write .env for compose
+        run: |
+          echo "BACKEND_TAG=$(cat backend-image-tag.txt | cut -d':' -f2)" >> infra_compose/.env
+          echo "FRONTEND_TAG=$(cat frontend-image-tag.txt | cut -d':' -f2)" >> infra_compose/.env
+          echo "SERVICE_NAME=health-api" >> infra_compose/.env
+          echo "VERSION=1.0.1" >> infra_compose/.env
+          echo "FLASK_ENV=production" >> infra_compose/.env
+          echo "POSTGRES_DB=health" >> infra_compose/.env
+          echo "POSTGRES_USER=postgres" >> infra_compose/.env
+          echo "POSTGRES_PASSWORD=postgres" >> infra_compose/.env
+          echo "POSTGRES_HOST=pgbouncer" >> infra_compose/.env
+          echo "POSTGRES_PORT=5432" >> infra_compose/.env
+          echo "KAFKA_TOPIC=health-checks" >> infra_compose/.env
+          echo "JAEGER_AGENT_HOST=jaeger" >> infra_compose/.env
+          echo "JAEGER_AGENT_PORT=6831" >> infra_compose/.env
+      - name: Run full stack via make
+        run: make -C infra_compose up
+      - name: Smoke test — health & version
+        run: |
+          curl --fail http://localhost/api/health
+          curl --fail http://localhost/api/version
+      - name: Logs & diagnostics
+        run: make -C infra_compose logs > staging-logs.txt
+      - name: Upload logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-logs
+          path: staging-logs.txt
+      - name: Check for failed containers
+        run: |
+          FAILED=$(docker ps -a --filter "status=exited" --filter "status=restarting" --format '{{.Names}}')
+          if [ -n "$FAILED" ]; then
+            echo "Detected failed containers:"
+            echo "$FAILED"
+            echo
+            for name in $FAILED; do
+              echo "Logs for $name:"
+              docker logs --tail 50 "$name" || true
+              echo "-----------------------------"
+            done
+            exit 1
+          else
+            echo "All containers running normally."
+          fi
+
+      # === START E2E TESTS ===
+      - name: Install dependencies for e2e-tests
+        run: pip install -r e2e_tests/requirements.txt
+      - name: Wait for API health
+        run: |
+          for i in {1..30}; do
+            curl --fail http://localhost/api/health && break
+            echo "waiting for API..."
+            sleep 2
+          done
+      - name: Wait for Kafka exporter metrics
+        run: |
+          for i in {1..30}; do
+            curl --fail http://localhost:9308/metrics && break
+            echo "waiting for Kafka exporter..."
+            sleep 2
+          done
+      - name: Run E2E tests
+        run: |
+          mkdir -p e2e_tests/test-results/allure
+          mkdir -p e2e_tests/test-results/junit
+          PYTHONPATH=. pytest e2e_tests/tests \
+            --alluredir=e2e_tests/test-results/allure \
+            --junitxml=e2e_tests/test-results/junit/junit.xml \
+            -v --tb=auto --maxfail=3 --disable-warnings
+      - uses: actions/upload-artifact@v4
+        with:
+          name: e2e-test-junit-report
+          path: e2e_tests/test-results/junit/junit.xml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: e2e-test-allure-results
+          path: e2e_tests/test-results/allure/
+  
+  # === ПОДПИСЬ STAGE ОБРАЗОВ ===
+  sign-images:
+    name: Cosign Sign Images
+    needs: deploy-stage-e2e-tests
+    runs-on: ubuntu-latest
+    env:
+      GHCR_REGISTRY: ghcr.io
+      GHCR_ORG: vik-devops-lab
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Cosign
+        uses: sigstore/cosign-installer@v3.5.0
+
+      - name: Set image tag for stage
+        id: vars
+        run: |
+          SHA_SHORT=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          echo "tag=stage-${SHA_SHORT}" >> $GITHUB_OUTPUT
+
+      - name: Build & push backend image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_ORG }}/health-api-backend:${{ steps.vars.outputs.tag }}
+
+      - name: Sign backend image
+        env:
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          echo "${{ secrets.COSIGN_KEY }}" > cosign.key
+          cosign sign --key cosign.key \
+            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_ORG }}/health-api-backend:${{ steps.vars.outputs.tag }}
+
+      - name: Build & push frontend image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_ORG }}/health-api-frontend:${{ steps.vars.outputs.tag }}
+
+      - name: Sign frontend image
+        env:
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          echo "${{ secrets.COSIGN_KEY }}" > cosign.key
+          cosign sign --key cosign.key \
+            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_ORG }}/health-api-frontend:${{ steps.vars.outputs.tag }}

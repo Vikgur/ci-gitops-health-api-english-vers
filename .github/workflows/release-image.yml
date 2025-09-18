@@ -1,0 +1,100 @@
+name: Release Docker images by tag (:version)
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release-images:
+    runs-on: ubuntu-latest
+    env:
+      GHCR_REGISTRY: ghcr.io
+      GHCR_ORG: vik-devops-lab
+      VERSION: ${{ github.ref_name }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up Cosign
+        uses: sigstore/cosign-installer@v3.5.0
+      - name: Build & push backend image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_ORG }}/health-api-backend:${{ env.VERSION }}
+      - name: Sign backend image
+        env:
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          COSIGN_EXPERIMENTAL: "1"
+          COSIGN_REKOR_URL: https://rekor.sigstore.dev
+        run: |
+          echo "${{ secrets.COSIGN_KEY }}" > cosign.key
+          cosign sign \
+            --key cosign.key \
+            --upload \
+            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_ORG }}/health-api-backend:${{ env.VERSION }}
+      - name: Build & push frontend image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_ORG }}/health-api-frontend:${{ env.VERSION }}
+      - name: Sign frontend image
+        env:
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          COSIGN_EXPERIMENTAL: "1"
+          COSIGN_REKOR_URL: https://rekor.sigstore.dev
+        run: |
+          echo "${{ secrets.COSIGN_KEY }}" > cosign.key
+          cosign sign \
+            --key cosign.key \
+            --upload \
+            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_ORG }}/health-api-frontend:${{ env.VERSION }}
+      
+      # === PR IN gitops-apps-health-api ===
+      - name: Checkout gitops repo
+        uses: actions/checkout@v4
+        with:
+          repository: vik-devops-lab/gitops-apps-health-api
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: gitops-apps
+
+      - name: Update image tag in values
+        run: |
+          cd gitops-apps
+          # обновляем backend
+          yq -i '.image.tag = "${{ github.ref_name }}"' helm/values/backend.yaml
+          # обновляем frontend
+          yq -i '.image.tag = "${{ github.ref_name }}"' helm/values/frontend.yaml
+
+      - name: Commit changes
+        run: |
+          cd gitops-apps
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b update-${{ github.ref_name }}
+          git add .
+          git commit -m "Update health-api images to ${{ github.ref_name }}"
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: gitops-apps
+          commit-message: "Update health-api images to ${{ github.ref_name }}"
+          title: "Update health-api to ${{ github.ref_name }}"
+          body: "Release images for ${{ github.ref_name }} are built and signed. This PR updates the gitops manifests."
+          branch: update-${{ github.ref_name }}
+          base: main

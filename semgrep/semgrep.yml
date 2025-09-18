@@ -1,0 +1,13 @@
+rules:
+  - id: gha-no-plaintext-secrets
+    pattern: |
+      password: ...
+    message: "Avoid hardcoding secrets in GitHub Actions workflows"
+    languages: [yaml]
+    severity: ERROR
+
+  - id: gha-no-unpinned-actions
+    pattern: uses: <ANY>
+    message: "Pin GitHub Actions to a commit SHA, not 'latest' or a tag"
+    languages: [yaml]
+    severity: WARNING
