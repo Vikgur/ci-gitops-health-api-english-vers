@@ -32,10 +32,11 @@ A unified pipeline is implemented, covering the full lifecycle of image delivery
 
 Only **signed and verified images** reach production.  
 
-**Rollout:**
-- On `stage`, deployment is fully automated via the GitOps chain:  
-**CI → Registry → Cosign → AIU → Argo CD → Rollout**.  
-- On `prod`, rollout happens automatically upon a manual tag.
+**Rollout:**  
+- On `stage`, it runs fully automatically through the GitOps chain:  
+  **CI → Registry → Cosign → AIU → Argo CD → Rollout**.  
+  Stage is always “one step ahead” and tests the latest release.  
+- On `prod`, rollout goes through a PR-gate triggered by a manual tag, using the **blue/green + canary** strategy for safe traffic switching and fast rollback capability.  
 
 ## Best Practice Separation
 
@@ -92,16 +93,18 @@ Directories:
 ### .github/workflows/release-image.yml
 
 **Purpose:**  
-Release workflow for publishing container images and creating a PR **to prod**.  
+Release workflow for publishing container images and creating PRs **to production**.  
 It uploads tagged artifacts, rebuilds `backend` and `frontend`, pushes them to GHCR, and signs with `cosign`.  
 
-On pushing a git tag (e.g. `v1.0.0`) to the main repository:  
-1. CI builds and signs images (`backend`, `frontend`) with the `v1.0.0` tag.  
-2. CI automatically opens a Pull Request in [`gitops-apps-health-api`](https://github.com/vikgur/gitops-apps-health-api-english-vers).  
-   * Under the hood it’s a simple `git clone` → edit only the required files (`values/*.yaml`) → new commit → PR.  
-   * Other files in `gitops-apps-health-api` remain unchanged.  
-3. The PR updates `values/*.yaml`, setting the new tag `v1.0.0`.  
-4. After merging the PR, Argo CD (auto-sync) applies the changes and rolls out the release to **prod**.  
+When a git tag is pushed (e.g., `v1.0.0`) to the main repository:  
+1. CI builds and signs the images (`backend`, `frontend`) with tag `v1.0.0`.  
+2. CI automatically opens a Pull Request in [`gitops-apps-health-api`](https://github.com/vikgur/gitops-apps-health-api).  
+   * Under the hood: `git clone` → edit only required files (`values/*.yaml` and `apps/prod/health-api.yaml`) → new commit → PR.  
+   * All other files in `gitops-apps-health-api` remain untouched.  
+3. The PR:  
+   * updates `values/*.yaml` with the new tag `v1.0.0`,  
+   * switches the overlay **blue ↔ green** so that the new version rolls out alongside the old one (blue-green + canary).  
+4. After merging the PR, ArgoCD (auto-sync) applies the changes and rolls out the release to **prod** using a blue-green strategy with canary steps.  
 
 ## Phases
 

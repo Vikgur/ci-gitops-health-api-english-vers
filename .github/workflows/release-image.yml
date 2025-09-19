@@ -71,13 +71,27 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           path: gitops-apps
 
-      - name: Update image tag in values
+      - name: Determine current color
+        run: |
+          cd gitops-apps
+          if grep -q "helm/values/blue/" apps/prod/health-api.yaml; then
+            echo "CURRENT=blue" >> $GITHUB_ENV
+            echo "NEXT=green" >> $GITHUB_ENV
+          else
+            echo "CURRENT=green" >> $GITHUB_ENV
+            echo "NEXT=blue" >> $GITHUB_ENV
+          fi
+
+      - name: Update image.tag and overlay
         run: |
           cd gitops-apps
           # обновляем backend
           yq -i '.image.tag = "${{ github.ref_name }}"' helm/values/backend.yaml
           # обновляем frontend
           yq -i '.image.tag = "${{ github.ref_name }}"' helm/values/frontend.yaml
+
+          # переключаем overlay blue <-> green
+          sed -i "s#helm/values/${CURRENT}#helm/values/${NEXT}#g" apps/prod/health-api.yaml
 
       - name: Commit changes
         run: |
@@ -86,15 +100,15 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b update-${{ github.ref_name }}
           git add .
-          git commit -m "Update health-api images to ${{ github.ref_name }}"
+          git commit -m "Update health-api images to ${{ github.ref_name }} via ${NEXT} overlay"
 
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           path: gitops-apps
-          commit-message: "Update health-api images to ${{ github.ref_name }}"
-          title: "Update health-api to ${{ github.ref_name }}"
-          body: "Release images for ${{ github.ref_name }} are built and signed. This PR updates the gitops manifests."
+          commit-message: "Update health-api images to ${{ github.ref_name }} via ${NEXT} overlay"
+          title: "Update health-api to ${{ github.ref_name }} (overlay: ${NEXT})"
+          body: "Release images for ${{ github.ref_name }} are built and signed. This PR updates the gitops manifests and switches overlay to **${NEXT}**."
           branch: update-${{ github.ref_name }}
           base: main
