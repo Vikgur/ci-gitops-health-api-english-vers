@@ -1,6 +1,7 @@
 # Table of Contents
 
 - [About the Project](#about-the-project)  
+  - [Release Scenario (Stage → Prod)](#release-scenario-stage--prod)
   - [Best Practice Separation](#best-practice-separation)  
   - [Intentional Simplifications](#intentional-simplifications)  
   - [Successful Run](#successful-run)  
@@ -37,6 +38,25 @@ Only **signed and verified images** reach production.
   **CI → Registry → Cosign → AIU → Argo CD → Rollout**.  
   Stage is always “one step ahead” and tests the latest release.  
 - On `prod`, rollout goes through a PR-gate triggered by a manual tag, using the **blue/green + canary** strategy for safe traffic switching and fast rollback capability.  
+
+### Release Scenario (Stage → Prod)
+
+1. **Release 1**  
+   - Deployed to Stage and Prod → active color `blue`.  
+
+2. **Release 2**  
+   - Automatically updated Stage.  
+   - On Prod, deployed as `green` alongside `blue`.  
+   - During canary switch a bug was found → rollback to `blue` (`abort/undo`).  
+   - Stage stays on release 2, Prod continues running release 1.  
+
+3. **Release 3 (fix)**  
+   - New tag → Stage updated.  
+   - On Prod, release 3 deployed as `green` alongside `blue` (release 1).  
+   - After successful test `promote` → `green` becomes active.  
+   - Stage and Prod are synchronized (both on release 3).  
+
+**Principle:** Stage is always “one step ahead,” Prod receives only validated releases via blue-green + canary.  
 
 ## Best Practice Separation
 
